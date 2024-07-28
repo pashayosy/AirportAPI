@@ -39,7 +39,7 @@ namespace AirportAPI.Services
 
         public async Task<IEnumerable<Leg>> GetLegsAsync()
         {
-            return await _context.Legs.ToListAsync();
+            return await _context.Legs.Include(l => l.CurrectFlights).ToListAsync();
         }
 
         public async Task AddFlightToLeg(int legId, int flightId)

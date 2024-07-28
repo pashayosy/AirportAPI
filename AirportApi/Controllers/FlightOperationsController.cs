@@ -55,4 +55,11 @@ public class FlightOperationsController : ControllerBase
         var logs = await _flightService.GetFlightsAsync();
         return Ok(logs);
     }
+
+    [HttpGet("Legs")]
+    public async Task<ActionResult<IEnumerable<Leg>>> GetLegs()
+    {
+        var legs = await _flightService.GetLegsAsync();
+        return Ok(legs);
+    }
 }
