@@ -19,4 +19,29 @@ public class Flight
 
     [ForeignKey("LegId")]
     public virtual Leg? CurrentLeg { get; set; }
+
+    // Delegate and event for flight movement
+    public delegate Task FlightMovedHandler(Flight flight, CancellationToken stoppingToken);
+    public FlightMovedHandler OnFlightMoved;
+
+    public async Task MoveToNextLegAsync(CancellationToken stoppingToken)
+    {
+        if (OnFlightMoved != null)
+        {
+            await OnFlightMoved(this, stoppingToken);
+        }
+    }
+
+    public async Task MoveFlightAsyncWrapper(CancellationToken stoppingToken)
+    {
+        while (CurrentLeg?.Id != 10)
+        {
+            if (OnFlightMoved != null)
+            {
+                await MoveToNextLegAsync(stoppingToken);
+            }
+        }
+        OnFlightMoved = null;
+
+    }
 }

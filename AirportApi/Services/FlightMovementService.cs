@@ -17,7 +17,10 @@ namespace AirportAPI.Services
     {
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<FlightMovementService> _logger;
-        private readonly ConcurrentQueue<Flight> _flightQueue = new ConcurrentQueue<Flight>();
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+
+        private static bool toggle = false;
+        private ConcurrentBag<Flight> _flightList = new ConcurrentBag<Flight>();
 
         public FlightMovementService(IServiceScopeFactory scopeFactory, ILogger<FlightMovementService> logger)
         {
@@ -40,27 +43,34 @@ namespace AirportAPI.Services
 
                         foreach (var flight in flights.Where(f => f.CurrentLeg.Id != 10 && f.CurrentLeg.Id != -1).OrderByDescending(f => f.CurrentLeg.Id))
                         {
-                            _flightQueue.Enqueue(flight);
+                            if (_flightList.FirstOrDefault(f => f.Id == flight.Id) == null)
+                            {
+                                flight.OnFlightMoved += MoveFlightAsync;
+                                _flightList.Add(flight);
+                                flight.MoveFlightAsyncWrapper(stoppingToken);
+                            }
                         }
                         var getWatingFlight = flights.FirstOrDefault(f => f.CurrentLeg.Id == -1);
                         if (getWatingFlight != null)
                         {
-                            _flightQueue.Enqueue(getWatingFlight);
-                        }
-                    }
-                    List<Task> tasks = new List<Task>();
+                            if (_flightList.FirstOrDefault(f => f.Id == getWatingFlight.Id) == null)
+                            {
+                                getWatingFlight.OnFlightMoved += MoveFlightAsync;
+                                _flightList.Add(getWatingFlight);
+                                getWatingFlight.MoveFlightAsyncWrapper(stoppingToken);
 
-                    while (_flightQueue.TryDequeue(out var flight))
-                    {
-                        // Run Tasl after task async and save to task list
-                        tasks.Add(Task.Run(async () =>
-                        {
-                            await MoveFlightAsync(flight, stoppingToken);
-                        }));
-                        await Task.Delay(500);
+                            }
+                        }
+                        await context.SaveChangesAsync();
                     }
-                    // Wait until all the Task finished
-                    await Task.WhenAll(tasks);
+
+                    ConcurrentBag<Flight> _NewflightList = new ConcurrentBag<Flight>();
+                    foreach (var flight in _flightList)
+                    {
+                        if (flight.CurrentLeg.Id != 10)
+                            _NewflightList.Add(flight);
+                    }
+                    _flightList = _NewflightList;
 
                 }
                 catch (Exception ex)
@@ -74,19 +84,22 @@ namespace AirportAPI.Services
             _logger.LogInformation("FlightMovementService stopped.");
         }
 
-        private async Task MoveFlightAsync(Flight flight, CancellationToken stoppingToken)
+        private async Task MoveFlightAsync(Flight moveFlight, CancellationToken stoppingToken)
         {
             // Create a scope for the flight
             using (var scope = _scopeFactory.CreateScope())
             {
                 var context = scope.ServiceProvider.GetRequiredService<AirportContext>();
+                var flights = await context.Flights.Include(f => f.CurrentLeg).ToListAsync();
+                var flight = flights.FirstOrDefault(f => f.Id == moveFlight.Id);
+
+                if (flight == null) return;
 
                 if (flight.CurrentLeg == null || flight.CurrentLeg.Id == 10) return;
 
                 var legId = flight.CurrentLeg.Id;
                 try
                 {
-                    bool respond = false;
                     _logger.LogInformation($"Attempting to move flight {flight.Id} from leg {legId}.");
 
                     switch (legId)
@@ -96,6 +109,7 @@ namespace AirportAPI.Services
                             break;
                         case 3:
                         case 8:
+                            bool respond = false;
                             respond = await PriorityWaitFor(context, 4, 8, flight.Status, stoppingToken);
                             if (respond)
                                 await WaitAndMoveFlight(context, flight, 4, stoppingToken);
@@ -106,10 +120,18 @@ namespace AirportAPI.Services
                                 await WaitAndMoveFlight(context, flight, freeLegId, stoppingToken);
                             break;
                         case 6:
-                            await WaitAndMoveFlight(context, flight, 8, stoppingToken);
-                            break;
                         case 7:
-                            await WaitAndMoveFlight(context, flight, 8, stoppingToken);
+                            if (legId == 6 && toggle)
+                            {
+                                await WaitAndMoveFlight(context, flight, 8, stoppingToken);
+                                toggle = !toggle;
+                            }
+
+                            if (legId == 7 && !toggle)
+                            {
+                                await WaitAndMoveFlight(context, flight, 8, stoppingToken);
+                                toggle = !toggle;
+                            }
                             break;
                         case 9:
                             await WaitAndMoveFlight(context, flight, 10, stoppingToken);
@@ -138,11 +160,18 @@ namespace AirportAPI.Services
 
         private async Task WaitAndMoveFlight(AirportContext context, Flight flight, int nextLegId, CancellationToken stoppingToken)
         {
+            await _semaphore.WaitAsync();
             if (!await WaitLegFree(context, nextLegId, stoppingToken))
             {
                 _logger.LogInformation($"Flight {flight.Id} waiting for leg {nextLegId} to be free.");
+                _semaphore.Release();
                 return;
             }
+            _logger.LogInformation($"Moving flight {flight.Id} from leg {flight.CurrentLeg.Id} to leg {nextLegId}.");
+            int currecFlighId = flight.CurrentLeg.Id;
+            await AddFlightToLeg(context, nextLegId, flight.Id, stoppingToken);
+            await RemoveFlightFromLeg(context, currecFlighId, flight, stoppingToken);
+            _semaphore.Release();
 
             await MoveFlightToNextLeg(context, flight, flight.CurrentLeg.Id, nextLegId, stoppingToken);
             return;
@@ -152,9 +181,6 @@ namespace AirportAPI.Services
         {
             try
             {
-                _logger.LogInformation($"Moving flight {flight.Id} from leg {currentLegId} to leg {nextLegId}.");
-                await RemoveFlightFromLeg(context, currentLegId, flight, stoppingToken);
-                await AddFlightToLeg(context, nextLegId, flight.Id, stoppingToken);
                 await PassTheLeg(context, nextLegId, stoppingToken);
                 _logger.LogInformation($"Flight {flight.Id} successfully moved from leg {currentLegId} to leg {nextLegId}.");
             }
@@ -175,8 +201,6 @@ namespace AirportAPI.Services
                     leg.CurrectFlights.Remove(flight);
                     _logger.LogInformation($"Leg {legId} after removal: {leg.CurrectFlights.Count}/{leg.Capacity} flights.");
                 }
-
-                flight.CurrentLeg = null;
 
                 var log = await context.FlightLogs.FirstOrDefaultAsync(log => log.FlightId == flight.Id && log.LegId == legId);
                 if (log != null)
@@ -216,6 +240,7 @@ namespace AirportAPI.Services
                 }
 
                 flight.LegId = legId;
+                flight.CurrentLeg = leg;
                 leg.CurrectFlights.Add(flight);
 
                 var log = await context.FlightLogs.FirstOrDefaultAsync(log => log.FlightId == flight.Id && log.LegId == legId);
@@ -334,8 +359,8 @@ namespace AirportAPI.Services
 
                 if (leg != null)
                 {
-                    _logger.LogInformation($"Passing the leg {legId}. Waiting for {10 * leg.CrossingTime} milliseconds.");
-                    await Task.Delay(10 * leg.CrossingTime, stoppingToken);
+                    _logger.LogInformation($"Passing the leg {legId}. Waiting for {100 * leg.CrossingTime} milliseconds.");
+                    await Task.Delay(100 * leg.CrossingTime, stoppingToken);
                 }
             }
             catch (Exception ex)

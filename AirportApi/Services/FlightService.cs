@@ -41,7 +41,6 @@ namespace AirportAPI.Services
         {
             return await _context.Legs.Include(l => l.CurrectFlights).ToListAsync();
         }
-
         public async Task AddFlightToLeg(int legId, int flightId)
         {
             var leg = await _context.Legs.FirstOrDefaultAsync(l => l.Id == legId);
